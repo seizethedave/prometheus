@@ -114,12 +114,14 @@ func makeLet(name string, expr parser.Expr, mkIn func(l *parser.LetExpr) parser.
 
 func TestCseRewrite(t *testing.T) {
 	cases := map[string]struct {
-		input    string
-		expected parser.Node
+		input       string
+		expected    parser.Node
+		expectedStr string
+		expectNoOp  bool
 	}{
 		"z*z": {
-			"z{} * z{}",
-			makeLet("var0",
+			input: "z{} * z{}",
+			expected: makeLet("var0",
 				&parser.VectorSelector{
 					Name: "z",
 					LabelMatchers: []*labels.Matcher{
@@ -140,8 +142,8 @@ func TestCseRewrite(t *testing.T) {
 			),
 		},
 		"z[w] * z[w]": {
-			"z{bar='weasel'} * z{bar='weasel'}",
-			makeLet("var0",
+			input: "z{bar='weasel'} * z{bar='weasel'}",
+			expected: makeLet("var0",
 				&parser.VectorSelector{
 					Name: "z",
 					LabelMatchers: []*labels.Matcher{
@@ -162,6 +164,45 @@ func TestCseRewrite(t *testing.T) {
 				},
 			),
 		},
+		"binexpr elimination": {
+			input: "64*290 + 64*290",
+			// should be rewritten to:
+			// let var0 = 64 * 290 in var0 + var0
+			expected: makeLet("var0",
+				&parser.BinaryExpr{
+					Op: parser.MUL,
+					LHS: &parser.NumberLiteral{
+						Val: 64,
+						PosRange: posrange.PositionRange{
+							Start: 0,
+							End:   2,
+						},
+					},
+					RHS: &parser.NumberLiteral{
+						Val: 290,
+						PosRange: posrange.PositionRange{
+							Start: 3,
+							End:   6,
+						},
+					},
+				}, func(let *parser.LetExpr) parser.Expr {
+					return &parser.BinaryExpr{
+						Op:  parser.ADD,
+						LHS: &parser.RefExpr{Ref: let},
+						RHS: &parser.RefExpr{Ref: let},
+					}
+				},
+			),
+		},
+		"different label values": {
+			input: "z{bar='weasel1'} * z{bar='weasel2'}",
+			// The two selectors are different, so they should not be CSE'd.
+			expectNoOp: true,
+		},
+		"don't eliminate scalars": {
+			input:      "123 * 123",
+			expectNoOp: true,
+		},
 	}
 
 	for n, c := range cases {
@@ -175,9 +216,19 @@ func TestCseRewrite(t *testing.T) {
 
 			e2, err := rewriteCse(e, nodeHash, cseInfo)
 			require.NoError(t, err)
-			require.Equal(t, c.expected, e2, "error on input '%s'", c.input)
 
-			//println(parser.Prettify(e2))
+			if c.expectNoOp {
+				c.expectedStr = c.input
+			}
+
+			if c.expectedStr != "" {
+				// Some expected values are expressible in the grammar, so we
+				// parse them to make test cases less laborious.
+				c.expected, err = parser.ParseExpr(c.expectedStr)
+				require.NoError(t, err)
+			}
+
+			require.Equal(t, c.expected, e2, "error on input '%s'", c.input, "prettified form: "+parser.Prettify(e2))
 		})
 	}
 }

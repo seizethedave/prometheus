@@ -3438,21 +3438,22 @@ func preprocessCse(expr parser.Expr) parser.Expr {
 	// simply keep scanning downward.
 	// Replace the matching node with a reference to the Let.
 
-	// TODO: Filter matching to those that are truly equal.
-
-	// TODO: Do not eliminate simple expressions that are just as cheap to duplicate. (e.g., scalars)
-
-	// Don't need to find the optimal height of the LetExpr placement, just
-	// place it at the top. Then, a different AST manipulation routine can move
-	// it down to the latest possible location. But, as PromQL ASTs are
-	// generally small, it won't be too impactful.
-
 	exp2, err := rewriteCse(expr, nodeHash, elims)
 	if err != nil {
 		panic(err)
 	}
 
 	return exp2
+}
+
+// shouldCse returns true if the node type should be considered for common subexpression elimination.
+func shouldCse(n parser.Node) bool {
+	switch n.(type) {
+	case *parser.StringLiteral, *parser.NumberLiteral, *parser.RefExpr:
+		// Exclude literals and refs.
+		return false
+	}
+	return true
 }
 
 func cseScan(n parser.Node, parent parser.Node, cseMap map[uint64]*cseInfo, nodeHash map[parser.Node]uint64) hash.Hash64 {
@@ -3465,8 +3466,12 @@ func cseScan(n parser.Node, parent parser.Node, cseMap map[uint64]*cseInfo, node
 		h.Write(childHash.Sum(nil))
 	}
 
-	s := h.Sum64()
+	if !shouldCse(n) {
+		// Non-CSE nodes are hashed but not tracked.
+		return h
+	}
 
+	s := h.Sum64()
 	info, ok := cseMap[s]
 	if !ok {
 		info = &cseInfo{
@@ -3493,7 +3498,9 @@ func rewriteCse(expr parser.Expr, nodeHash map[parser.Node]uint64, cseInfo map[u
 		return nil, err
 	}
 
-	// Now install any bindings at the top of the expression tree.
+	// Now install any generated reference bindings. Since this is the only
+	// place in PromQL that can introduce variable bindings, we can just inject
+	// them at the root.
 	for _, b := range v.bindings {
 		b.InExpr = expr
 		expr = b
