@@ -3423,13 +3423,17 @@ type cseNode struct {
 	parent parser.Node
 }
 
+// preprocessCse performs common subexpression elimination on the given expression.
 func preprocessCse(expr parser.Expr) parser.Expr {
 	// Perform a post-order traversal of the expression tree. Compute hashes along the way.
 	// Keep a map of hash -> expr for all expressions encountered.
+	c := &cseRewriter{
+		nodeHash: make(map[parser.Node]uint64),
+		cseInfo:  make(map[uint64]*cseInfo),
+		bindings: []*parser.LetExpr{},
+	}
 
-	nodeHash := make(map[parser.Node]uint64)
-	elims := make(map[uint64]*cseInfo)
-	cseScan(expr, nil, elims, nodeHash)
+	c.cseScan(expr, nil)
 
 	// Then do another top-down pass to find the largest common subexpressions.
 	// If we encounter one, and they're equal, capture the expression as a Let
@@ -3438,7 +3442,7 @@ func preprocessCse(expr parser.Expr) parser.Expr {
 	// simply keep scanning downward.
 	// Replace the matching node with a reference to the Let.
 
-	exp2, err := rewriteCse(expr, nodeHash, elims)
+	exp2, err := c.rewriteCse(expr)
 	if err != nil {
 		panic(err)
 	}
@@ -3456,13 +3460,13 @@ func shouldCse(n parser.Node) bool {
 	return true
 }
 
-func cseScan(n parser.Node, parent parser.Node, cseMap map[uint64]*cseInfo, nodeHash map[parser.Node]uint64) hash.Hash64 {
+func (c *cseRewriter) cseScan(n parser.Node, parent parser.Node) hash.Hash64 {
 	h := fnv.New64a()
 	// TODO: fix this hash computation so it isn't n^2.
 	h.Write([]byte(n.String()))
 
 	for _, child := range parser.Children(n) {
-		childHash := cseScan(child, n, cseMap, nodeHash)
+		childHash := c.cseScan(child, n)
 		h.Write(childHash.Sum(nil))
 	}
 
@@ -3472,36 +3476,31 @@ func cseScan(n parser.Node, parent parser.Node, cseMap map[uint64]*cseInfo, node
 	}
 
 	s := h.Sum64()
-	info, ok := cseMap[s]
+	info, ok := c.cseInfo[s]
 	if !ok {
 		info = &cseInfo{
 			binding: nil,
 			nodes:   []*cseNode{},
 		}
-		cseMap[s] = info
+		c.cseInfo[s] = info
 	}
 	info.nodes = append(info.nodes, &cseNode{node: n, parent: parent})
-	nodeHash[n] = s
+	c.nodeHash[n] = s
 	return h
 }
 
-func rewriteCse(expr parser.Expr, nodeHash map[parser.Node]uint64, cseInfo map[uint64]*cseInfo) (parser.Expr, error) {
-	v := &cseVisitor{
-		nodeHash: nodeHash,
-		cseInfo:  cseInfo,
-		bindings: []*parser.LetExpr{},
-	}
+func (c *cseRewriter) rewriteCse(expr parser.Expr) (parser.Expr, error) {
 
 	// TODO: this will be simpler if there's a parser.Rewrite() so we don't have
 	// to track and manipulate parent pointers.
-	if err := parser.Walk(v, expr, nil); err != nil {
+	if err := parser.Walk(c, expr, nil); err != nil {
 		return nil, err
 	}
 
 	// Now install any generated reference bindings. Since this is the only
 	// place in PromQL that can introduce variable bindings, we can just inject
 	// them at the root.
-	for _, b := range v.bindings {
+	for _, b := range c.bindings {
 		b.InExpr = expr
 		expr = b
 	}
@@ -3509,13 +3508,13 @@ func rewriteCse(expr parser.Expr, nodeHash map[parser.Node]uint64, cseInfo map[u
 	return expr, nil
 }
 
-type cseVisitor struct {
+type cseRewriter struct {
 	nodeHash map[parser.Node]uint64
 	cseInfo  map[uint64]*cseInfo
 	bindings []*parser.LetExpr
 }
 
-func (c *cseVisitor) Visit(node parser.Node, path []parser.Node) (w parser.Visitor, err error) {
+func (c *cseRewriter) Visit(node parser.Node, path []parser.Node) (w parser.Visitor, err error) {
 	if node == nil {
 		return c, nil
 	}
