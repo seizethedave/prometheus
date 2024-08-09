@@ -1081,12 +1081,12 @@ load 10s
 			},
 		},
 		{
-			Query:        "sum(max_over_time(metricWith3SampleEvery10Seconds[60s:5s])) + sum(max_over_time(metricWith3SampleEvery10Seconds[60s:5s]))",
+			Query:        "sum(max_over_time(metricWith3SampleEvery10Seconds[60s:5s])) + sum(max_over_time(metricWith3SampleEvery10Seconds[60s:5s])) # (CSE)",
 			Start:        time.Unix(201, 0),
 			PeakSamples:  52,
-			TotalSamples: 72, // 2 * (3 sample per query * 12 queries (60/5))
+			TotalSamples: 36, // 1 (CSE) * (3 sample per query * 12 queries (60/5))
 			TotalSamplesPerStep: stats.TotalSamplesPerStep{
-				201000: 72,
+				201000: 36,
 			},
 		},
 		{
@@ -1274,7 +1274,7 @@ load 10s
 			},
 		},
 		{
-			Query:        "sum(max_over_time(metricWith3SampleEvery10Seconds[60s:5s])) + sum(max_over_time(metricWith3SampleEvery10Seconds[60s:5s]))",
+			Query:        "sum(max_over_time(metricWith3SampleEvery10Seconds[60s:5s])) + sum(max_over_time(metricWith3SampleEvery10Seconds[60s:5s])) #JOO",
 			Start:        time.Unix(201, 0),
 			End:          time.Unix(220, 0),
 			Interval:     5 * time.Second,

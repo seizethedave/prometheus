@@ -714,6 +714,7 @@ func (ng *Engine) execEvalStmt(ctx context.Context, query *query, s *parser.Eval
 			lookbackDelta:            s.LookbackDelta,
 			samplesStats:             query.sampleStats,
 			noStepSubqueryIntervalFn: ng.noStepSubqueryIntervalFn,
+			bindings:                 make(map[*parser.LetExpr]*bindingRef),
 		}
 		query.sampleStats.InitStepTracking(start, start, 1)
 
@@ -772,6 +773,7 @@ func (ng *Engine) execEvalStmt(ctx context.Context, query *query, s *parser.Eval
 		lookbackDelta:            s.LookbackDelta,
 		samplesStats:             query.sampleStats,
 		noStepSubqueryIntervalFn: ng.noStepSubqueryIntervalFn,
+		bindings:                 make(map[*parser.LetExpr]*bindingRef),
 	}
 	query.sampleStats.InitStepTracking(evaluator.startTimestamp, evaluator.endTimestamp, evaluator.interval)
 	val, warnings, err := evaluator.Eval(s.Expr)
@@ -1017,6 +1019,11 @@ type errWithWarnings struct {
 
 func (e errWithWarnings) Error() string { return e.err.Error() }
 
+type bindingRef struct {
+	val   parser.Value
+	annos annotations.Annotations
+}
+
 // An evaluator evaluates the given expressions over the given fixed
 // timestamps. It is attached to an engine through which it connects to a
 // querier and reports errors. On timeout or cancellation of its context it
@@ -1034,6 +1041,8 @@ type evaluator struct {
 	lookbackDelta            time.Duration
 	samplesStats             *stats.QuerySamples
 	noStepSubqueryIntervalFn func(rangeMillis int64) int64
+
+	bindings map[*parser.LetExpr]*bindingRef
 }
 
 // errorf causes a panic with the input formatted into an error.
@@ -1915,6 +1924,8 @@ func (ev *evaluator) eval(expr parser.Expr) (parser.Value, annotations.Annotatio
 			lookbackDelta:            ev.lookbackDelta,
 			samplesStats:             ev.samplesStats.NewChild(),
 			noStepSubqueryIntervalFn: ev.noStepSubqueryIntervalFn,
+			// Share the existing evaluator bindings.
+			bindings: ev.bindings,
 		}
 
 		if e.Step != 0 {
@@ -1942,6 +1953,7 @@ func (ev *evaluator) eval(expr parser.Expr) (parser.Value, annotations.Annotatio
 		ev.samplesStats.UpdatePeakFromSubquery(newEv.samplesStats)
 		ev.samplesStats.IncrementSamplesAtTimestamp(ev.endTimestamp, newEv.samplesStats.TotalSamples)
 		return res, ws
+
 	case *parser.StepInvariantExpr:
 		switch ce := e.Expr.(type) {
 		case *parser.StringLiteral, *parser.NumberLiteral:
@@ -1959,6 +1971,8 @@ func (ev *evaluator) eval(expr parser.Expr) (parser.Value, annotations.Annotatio
 			lookbackDelta:            ev.lookbackDelta,
 			samplesStats:             ev.samplesStats.NewChild(),
 			noStepSubqueryIntervalFn: ev.noStepSubqueryIntervalFn,
+			// Share the existing evaluator bindings.
+			bindings: ev.bindings,
 		}
 		res, ws := newEv.eval(e.Expr)
 		ev.currentSamples = newEv.currentSamples
@@ -2007,6 +2021,19 @@ func (ev *evaluator) eval(expr parser.Expr) (parser.Value, annotations.Annotatio
 		}
 		ev.samplesStats.UpdatePeak(ev.currentSamples)
 		return res, ws
+
+	case *parser.LetExpr:
+		result, anno := ev.eval(e.Expr)
+		// Stash it for future reference.
+		ev.bindings[e] = &bindingRef{result, anno}
+		// And evaluate the body.
+		return ev.eval(e.InExpr)
+
+	case *parser.RefExpr:
+		// Should have been preceded by a LetExpr. Look up the stored binding.
+		if b, ok := ev.bindings[e.Ref]; ok {
+			return b.val, b.annos
+		}
 	}
 
 	panic(fmt.Errorf("unhandled expression of type: %T", expr))
@@ -3490,7 +3517,6 @@ func (c *cseRewriter) cseScan(n parser.Node, parent parser.Node) hash.Hash64 {
 }
 
 func (c *cseRewriter) rewriteCse(expr parser.Expr) (parser.Expr, error) {
-
 	// TODO: this will be simpler if there's a parser.Rewrite() so we don't have
 	// to track and manipulate parent pointers.
 	if err := parser.Walk(c, expr, nil); err != nil {
@@ -3504,6 +3530,8 @@ func (c *cseRewriter) rewriteCse(expr parser.Expr) (parser.Expr, error) {
 		b.InExpr = expr
 		expr = b
 	}
+
+	println(parser.Prettify(expr))
 
 	return expr, nil
 }

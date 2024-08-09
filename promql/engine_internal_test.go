@@ -207,6 +207,27 @@ func TestCseRewrite(t *testing.T) {
 			input:      "123 * 123",
 			expectNoOp: true,
 		},
+		"unary binop": {
+			input: "-(1) * -(1)",
+			expected: makeLet("var0",
+				&parser.UnaryExpr{
+					Op: parser.SUB,
+					Expr: &parser.ParenExpr{
+						Expr: &parser.NumberLiteral{
+							Val:      1,
+							PosRange: posrange.PositionRange{Start: 2, End: 3},
+						},
+						PosRange: posrange.PositionRange{Start: 1, End: 4},
+					},
+				}, func(let *parser.LetExpr) parser.Expr {
+					return &parser.BinaryExpr{
+						Op:  parser.MUL,
+						LHS: &parser.RefExpr{Ref: let},
+						RHS: &parser.RefExpr{Ref: let},
+					}
+				},
+			),
+		},
 	}
 
 	for n, tc := range cases {

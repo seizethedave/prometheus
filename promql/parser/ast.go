@@ -274,7 +274,7 @@ func (e *BinaryExpr) Type() ValueType {
 }
 func (e *StepInvariantExpr) Type() ValueType { return e.Expr.Type() }
 func (e *LetExpr) Type() ValueType           { return e.InExpr.Type() }
-func (e *RefExpr) Type() ValueType           { return e.Ref.Type() }
+func (e *RefExpr) Type() ValueType           { return e.Ref.Expr.Type() }
 
 func (*AggregateExpr) PromQLExpr()     {}
 func (*BinaryExpr) PromQLExpr()        {}
@@ -437,6 +437,11 @@ func Children(node Node) []Node {
 		return []Node{n.VectorSelector}
 	case *StepInvariantExpr:
 		return []Node{n.Expr}
+	case *LetExpr:
+		return []Node{n.Expr, n.InExpr}
+	case *RefExpr:
+		// ??? Do we return the referenced LetExpr? This would produce cycles.
+		return []Node{}
 	case *NumberLiteral, *StringLiteral, *VectorSelector:
 		// nothing to do
 		return []Node{}
