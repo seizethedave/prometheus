@@ -3413,6 +3413,11 @@ func newStepInvariantExpr(expr parser.Expr) parser.Expr {
 	return &parser.StepInvariantExpr{Expr: expr}
 }
 
+type cseInfo struct {
+	binding *parser.LetExpr
+	nodes   []*cseNode
+}
+
 type cseNode struct {
 	node   parser.Node
 	parent parser.Node
@@ -3423,86 +3428,34 @@ func preprocessCse(expr parser.Expr) parser.Expr {
 	// Keep a map of hash -> expr for all expressions encountered.
 
 	nodeHash := make(map[parser.Node]uint64)
-	cseInfo := make(map[uint64][]*cseNode)
-	cseScan(expr, nil, cseInfo, nodeHash)
+	elims := make(map[uint64]*cseInfo)
+	cseScan(expr, nil, elims, nodeHash)
 
 	// Then do another top-down pass to find the largest common subexpressions.
 	// If we encounter one, and they're equal, capture the expression as a Let
 	// expr and replace matching expressions with a reference to the Let.
 	// If they're not equal (which would be a very rare hash collision), we
 	// simply keep scanning downward.
+	// Replace the matching node with a reference to the Let.
 
 	// TODO: Filter matching to those that are truly equal.
-	// Replace the matching node with a reference to the Let.
-	exp2 := rewriteCse(expr, nodeHash, cseInfo)
+
+	// TODO: Do not eliminate simple expressions that are just as cheap to duplicate. (e.g., scalars)
+
+	// Don't need to find the optimal height of the LetExpr placement, just
+	// place it at the top. Then, a different AST manipulation routine can move
+	// it down to the latest possible location. But, as PromQL ASTs are
+	// generally small, it won't be too impactful.
+
+	exp2, err := rewriteCse(expr, nodeHash, elims)
+	if err != nil {
+		panic(err)
+	}
+
 	return exp2
 }
 
-func rewriteCse(expr parser.Expr, nodeHash map[parser.Node]uint64, cseInfo map[uint64][]*cseNode) parser.Expr {
-	errStop := errors.New("stop")
-	varNum := 0
-
-	parser.Inspect(expr, func(node parser.Node, path []parser.Node) error {
-		e, ok := node.(parser.Expr)
-		if !ok {
-			// Only interested in exprs.
-			return nil
-		}
-
-		if h, ok := nodeHash[e]; ok {
-			if matching, ok := cseInfo[h]; ok {
-				if len(matching) > 1 {
-					varName := fmt.Sprintf("var%d", varNum)
-					varNum++
-					replacement := &parser.LetExpr{
-						Name:   varName,
-						Expr:   e,
-						InExpr: nil,
-					}
-
-					for _, match := range matching {
-						if match.node == node {
-							continue
-						}
-
-						switch p := match.parent.(type) {
-						case *parser.BinaryExpr:
-							if p.LHS == match.node {
-								p.LHS = replacement
-							} else {
-								p.RHS = replacement
-							}
-						case *parser.Call:
-							for i, arg := range p.Args {
-								if arg == match.node {
-									p.Args[i] = replacement
-								}
-							}
-						case *parser.MatrixSelector:
-							if p.VectorSelector == match.node {
-								p.VectorSelector = replacement
-							}
-						case *parser.SubqueryExpr:
-							if p.Expr == match.node {
-								p.Expr = replacement
-							}
-						default:
-							panic(fmt.Sprintf("unexpected parent type %T", p))
-						}
-
-					}
-
-					return errStop
-				}
-			}
-		}
-		return nil
-	})
-
-	return expr
-}
-
-func cseScan(n parser.Node, parent parser.Node, cseMap map[uint64][]*cseNode, nodeHash map[parser.Node]uint64) hash.Hash64 {
+func cseScan(n parser.Node, parent parser.Node, cseMap map[uint64]*cseInfo, nodeHash map[parser.Node]uint64) hash.Hash64 {
 	h := fnv.New64a()
 	// TODO: fix this hash computation so it isn't n^2.
 	h.Write([]byte(n.String()))
@@ -3513,9 +3466,121 @@ func cseScan(n parser.Node, parent parser.Node, cseMap map[uint64][]*cseNode, no
 	}
 
 	s := h.Sum64()
-	cseMap[s] = append(cseMap[s], &cseNode{node: n, parent: parent})
+
+	info, ok := cseMap[s]
+	if !ok {
+		info = &cseInfo{
+			binding: nil,
+			nodes:   []*cseNode{},
+		}
+		cseMap[s] = info
+	}
+	info.nodes = append(info.nodes, &cseNode{node: n, parent: parent})
 	nodeHash[n] = s
 	return h
+}
+
+func rewriteCse(expr parser.Expr, nodeHash map[parser.Node]uint64, cseInfo map[uint64]*cseInfo) (parser.Expr, error) {
+	v := &cseVisitor{
+		nodeHash: nodeHash,
+		cseInfo:  cseInfo,
+		bindings: []*parser.LetExpr{},
+	}
+
+	// TODO: this will be simpler if there's a parser.Rewrite() so we don't have
+	// to track and manipulate the parent pointers.
+	if err := parser.Walk(v, expr, nil); err != nil {
+		return nil, err
+	}
+
+	// Now install any bindings at the top of the expression tree.
+	for _, b := range v.bindings {
+		b.InExpr = expr
+		expr = b
+	}
+
+	return expr, nil
+}
+
+type cseVisitor struct {
+	nodeHash map[parser.Node]uint64
+	cseInfo  map[uint64]*cseInfo
+	bindings []*parser.LetExpr
+}
+
+func (c *cseVisitor) Visit(node parser.Node, path []parser.Node) (w parser.Visitor, err error) {
+	if node == nil {
+		return c, nil
+	}
+	e, ok := node.(parser.Expr)
+	if !ok {
+		// Only interested in exprs.
+		return c, nil
+	}
+
+	h, nodeHit := c.nodeHash[e]
+	if !nodeHit {
+		// Not marked by scan phase.
+		return c, nil
+	}
+	inf, ok := c.cseInfo[h]
+	if !ok {
+		panic("hash found but no matches")
+	}
+	if len(inf.nodes) == 1 {
+		// No common subexpression.
+		return c, nil
+	}
+
+	if inf.binding == nil {
+		varName := fmt.Sprintf("var%d", len(c.bindings))
+		inf.binding = &parser.LetExpr{
+			Name:   varName,
+			Expr:   e,
+			InExpr: nil, // Will be set later when binding is installed.
+		}
+		c.bindings = append(c.bindings, inf.binding)
+	}
+
+	ref := &parser.RefExpr{
+		Ref: inf.binding,
+	}
+
+	for _, match := range inf.nodes {
+		if match.node != node {
+			continue
+		}
+
+		switch p := match.parent.(type) {
+		case *parser.BinaryExpr:
+			if p.LHS == match.node {
+				p.LHS = ref
+			} else {
+				p.RHS = ref
+			}
+		case *parser.Call:
+			for i, arg := range p.Args {
+				if arg == match.node {
+					p.Args[i] = ref
+				}
+			}
+		case *parser.MatrixSelector:
+			if p.VectorSelector == match.node {
+				p.VectorSelector = ref
+			}
+		case *parser.SubqueryExpr:
+			if p.Expr == match.node {
+				p.Expr = ref
+			}
+		default:
+			panic(fmt.Sprintf("unexpected parent type %T", p))
+		}
+
+		// Tell the visitor code to stop traversing this subtree.
+		return nil, nil
+	}
+
+	return c, nil
 }
 
 // setOffsetForAtModifier modifies the offset of vector and matrix selector

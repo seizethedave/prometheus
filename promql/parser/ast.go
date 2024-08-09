@@ -191,6 +191,7 @@ func (e *StepInvariantExpr) PositionRange() posrange.PositionRange {
 
 // A LetExpr is a let expression that binds a name to an expression, allowing
 // the expression to be bound as `Name` and reused inside of InExpr.
+// A LetExpr behaves as and has the type of InExpr.
 type LetExpr struct {
 	Name   string
 	Expr   Expr
@@ -202,8 +203,22 @@ func (e *LetExpr) String() string {
 }
 
 func (e *LetExpr) PositionRange() posrange.PositionRange {
-	// ???
-	return mergeRanges(e.Expr, e.InExpr)
+	// Not part of the expressible syntax, so it doesn't have a position.
+	return posrange.PositionRange{}
+}
+
+// A reference to a variable bound by a LetExpr.
+type RefExpr struct {
+	Ref *LetExpr
+}
+
+func (e *RefExpr) String() string {
+	return e.Ref.Name
+}
+
+func (e *RefExpr) PositionRange() posrange.PositionRange {
+	// RefExpr isn't part of the expressible syntax, so it doesn't have a position.
+	return posrange.PositionRange{}
 }
 
 // VectorSelector represents a Vector selection.
@@ -259,6 +274,7 @@ func (e *BinaryExpr) Type() ValueType {
 }
 func (e *StepInvariantExpr) Type() ValueType { return e.Expr.Type() }
 func (e *LetExpr) Type() ValueType           { return e.InExpr.Type() }
+func (e *RefExpr) Type() ValueType           { return e.Ref.Type() }
 
 func (*AggregateExpr) PromQLExpr()     {}
 func (*BinaryExpr) PromQLExpr()        {}
@@ -272,6 +288,7 @@ func (*UnaryExpr) PromQLExpr()         {}
 func (*VectorSelector) PromQLExpr()    {}
 func (*StepInvariantExpr) PromQLExpr() {}
 func (*LetExpr) PromQLExpr()           {}
+func (*RefExpr) PromQLExpr()           {}
 
 // VectorMatchCardinality describes the cardinality relationship
 // of two Vectors in a binary operation.
@@ -345,25 +362,6 @@ func Walk(v Visitor, node Node, path []Node) error {
 	return err
 }
 
-func WalkPostOrder(v Visitor, node Node, path []Node) error {
-	var err error
-	path = append(path, node)
-
-	for _, e := range Children(node) {
-		if err := WalkPostOrder(v, e, path); err != nil {
-			return err
-		}
-	}
-
-	if v, err = v.Visit(node, path); v == nil || err != nil {
-		return err
-	}
-
-	// ???
-	// _, err = v.Visit(nil, nil)
-	return nil
-}
-
 func ExtractSelectors(expr Expr) [][]*labels.Matcher {
 	var selectors [][]*labels.Matcher
 	Inspect(expr, func(node Node, _ []Node) error {
@@ -392,11 +390,6 @@ func (f inspector) Visit(node Node, path []Node) (Visitor, error) {
 func Inspect(node Node, f inspector) {
 	//nolint: errcheck
 	Walk(f, node, nil)
-}
-
-func InspectPostOrder(node Node, f inspector) {
-	//nolint: errcheck
-	WalkPostOrder(f, node, nil)
 }
 
 // Children returns a list of all child nodes of a syntax tree node.
