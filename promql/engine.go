@@ -3488,7 +3488,7 @@ func rewriteCse(expr parser.Expr, nodeHash map[parser.Node]uint64, cseInfo map[u
 	}
 
 	// TODO: this will be simpler if there's a parser.Rewrite() so we don't have
-	// to track and manipulate the parent pointers.
+	// to track and manipulate parent pointers.
 	if err := parser.Walk(v, expr, nil); err != nil {
 		return nil, err
 	}

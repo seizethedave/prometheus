@@ -101,9 +101,9 @@ func TestCseScan(t *testing.T) {
 	assert.Len(t, cseInfo, 3)
 }
 
-// withLet allows tests to create a LetExpr with a given name and expression,
-// and with the let ptr plumbed into the InExpr.
-func withLet(name string, expr parser.Expr, mkIn func(l *parser.LetExpr) parser.Expr) *parser.LetExpr {
+// makeLet allows tests to create a LetExpr with a given name and expression,
+// plumbing the LetExpr pointer into InExpr.
+func makeLet(name string, expr parser.Expr, mkIn func(l *parser.LetExpr) parser.Expr) *parser.LetExpr {
 	let := &parser.LetExpr{
 		Name: name,
 		Expr: expr,
@@ -119,7 +119,7 @@ func TestCseRewrite(t *testing.T) {
 	}{
 		"z*z": {
 			"z{} * z{}",
-			withLet("var0",
+			makeLet("var0",
 				&parser.VectorSelector{
 					Name: "z",
 					LabelMatchers: []*labels.Matcher{
@@ -139,30 +139,29 @@ func TestCseRewrite(t *testing.T) {
 				},
 			),
 		},
-		/*
-			"z_w*z_w": {
-				"z{bar='weasel'} * z{bar='weasel'}",
-				withLet("var0",
-					&parser.VectorSelector{
-						Name: "z",
-						LabelMatchers: []*labels.Matcher{
-							parser.MustLabelMatcher(labels.MatchEqual, model.MetricNameLabel, "z"),
-						},
-						PosRange: posrange.PositionRange{
-							Start: 0,
-							End:   3,
-						},
-					}, func(let *parser.LetExpr) parser.Expr {
-						return &parser.BinaryExpr{
-							Op:             parser.MUL,
-							LHS:            &parser.RefExpr{Ref: let},
-							RHS:            &parser.RefExpr{Ref: let},
-							VectorMatching: &parser.VectorMatching{},
-						}
+		"z[w] * z[w]": {
+			"z{bar='weasel'} * z{bar='weasel'}",
+			makeLet("var0",
+				&parser.VectorSelector{
+					Name: "z",
+					LabelMatchers: []*labels.Matcher{
+						parser.MustLabelMatcher(labels.MatchEqual, "bar", "weasel"),
+						parser.MustLabelMatcher(labels.MatchEqual, model.MetricNameLabel, "z"),
 					},
-				),
-			},
-		*/
+					PosRange: posrange.PositionRange{
+						Start: 0,
+						End:   15,
+					},
+				}, func(let *parser.LetExpr) parser.Expr {
+					return &parser.BinaryExpr{
+						Op:             parser.MUL,
+						LHS:            &parser.RefExpr{Ref: let},
+						RHS:            &parser.RefExpr{Ref: let},
+						VectorMatching: &parser.VectorMatching{},
+					}
+				},
+			),
+		},
 	}
 
 	for n, c := range cases {
