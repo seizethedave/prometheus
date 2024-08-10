@@ -2033,6 +2033,8 @@ func (ev *evaluator) eval(expr parser.Expr) (parser.Value, annotations.Annotatio
 		// Should have been preceded by a LetExpr. Look up the stored binding.
 		if b, ok := ev.bindings[e.Ref]; ok {
 			return b.val, b.annos
+		} else {
+			panic("internal error: RefExpr without a LetExpr")
 		}
 	}
 
