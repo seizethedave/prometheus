@@ -3533,8 +3533,6 @@ func (c *cseRewriter) rewriteCse(expr parser.Expr) (parser.Expr, error) {
 		expr = b
 	}
 
-	println(parser.Prettify(expr))
-
 	return expr, nil
 }
 
