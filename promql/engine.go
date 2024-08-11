@@ -3606,6 +3606,10 @@ func (c *cseRewriter) Visit(node parser.Node, path []parser.Node) (w parser.Visi
 			if p.Expr == match.node {
 				p.Expr = ref
 			}
+		case *parser.AggregateExpr:
+			if p.Expr == match.node {
+				p.Expr = ref
+			}
 		default:
 			panic(fmt.Sprintf("unexpected parent type %T", p))
 		}

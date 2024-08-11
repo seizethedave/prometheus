@@ -199,8 +199,7 @@ func TestCseRewrite(t *testing.T) {
 			),
 		},
 		"different label values": {
-			input: "z{bar='weasel1'} * z{bar='weasel2'}",
-			// The two selectors are different, so they should not be CSE'd.
+			input:      "z{bar='weasel1'} * z{bar='weasel2'}",
 			expectNoOp: true,
 		},
 		"don't eliminate scalars": {
@@ -228,6 +227,34 @@ func TestCseRewrite(t *testing.T) {
 				},
 			),
 		},
+		"aggregator": {
+			input: "min(a_one) + min(a_one)",
+			expected: makeLet("var0",
+				&parser.AggregateExpr{
+					Op: parser.MIN,
+					Expr: &parser.VectorSelector{
+						Name: "a_one",
+						LabelMatchers: []*labels.Matcher{
+							parser.MustLabelMatcher(labels.MatchEqual, model.MetricNameLabel, "a_one"),
+						},
+						PosRange: posrange.PositionRange{Start: 4, End: 9},
+					},
+					PosRange: posrange.PositionRange{Start: 0, End: 10},
+				},
+				func(let *parser.LetExpr) parser.Expr {
+					return &parser.BinaryExpr{
+						Op:             parser.ADD,
+						LHS:            &parser.RefExpr{Ref: let},
+						RHS:            &parser.RefExpr{Ref: let},
+						VectorMatching: &parser.VectorMatching{},
+					}
+				},
+			),
+		},
+		"big aggregator": {
+			input:      "max(http_requests) by (job) + avg(http_requests) by (job)",
+			expectNoOp: true,
+		},
 	}
 
 	for n, tc := range cases {
@@ -242,6 +269,16 @@ func TestCseRewrite(t *testing.T) {
 			}
 
 			c.cseScan(e, nil)
+			/*
+				fmt.Println(c.cseInfo)
+				for _, v := range c.cseInfo {
+
+					for i, n := range v.nodes {
+						fmt.Println(i, "parent:", n.parent, "node:", n.node)
+					}
+				}
+			*/
+
 			e2, err := c.rewriteCse(e)
 			require.NoError(t, err)
 

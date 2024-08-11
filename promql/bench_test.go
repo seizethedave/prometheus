@@ -237,10 +237,7 @@ func rangeQueryCases() []benchCase {
 			expr: "a_X + a_X",
 		},
 		{
-			expr: "-(256 * 2) + -(256 * 2)",
-		},
-		{
-			expr: "rate(a_X[1m] + a_X[1m]) - rate(a_X[1m])",
+			expr: "(-(256 * 2) + -(256 * 2)) * a_ten",
 		},
 	}
 
