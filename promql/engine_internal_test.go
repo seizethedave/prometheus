@@ -251,9 +251,48 @@ func TestCseRewrite(t *testing.T) {
 				},
 			),
 		},
-		"big aggregator": {
-			input:      "max(http_requests) by (job) + avg(http_requests) by (job)",
-			expectNoOp: true,
+		"aggregator expr": {
+			input: "max by (job) (http_requests{}) + avg by (job) (http_requests{})",
+			expected: makeLet("var0",
+				&parser.VectorSelector{
+					Name: "http_requests",
+					LabelMatchers: []*labels.Matcher{
+						parser.MustLabelMatcher(labels.MatchEqual, model.MetricNameLabel, "http_requests"),
+					},
+					PosRange: posrange.PositionRange{Start: 14, End: 29},
+				},
+				func(let *parser.LetExpr) parser.Expr {
+					return &parser.BinaryExpr{
+						Op: parser.ADD,
+						LHS: &parser.AggregateExpr{
+							Op: parser.MAX,
+							Expr: &parser.RefExpr{
+								Ref: let,
+							},
+							Param:    nil,
+							Grouping: []string{"job"},
+							PosRange: posrange.PositionRange{
+								Start: 0,
+								End:   30,
+							},
+						},
+						RHS: &parser.AggregateExpr{
+							Op: parser.AVG,
+							Expr: &parser.RefExpr{
+								Ref: let,
+							},
+							Param:    nil,
+							Grouping: []string{"job"},
+							PosRange: posrange.PositionRange{
+								Start: 33,
+								End:   63,
+							},
+						},
+
+						VectorMatching: &parser.VectorMatching{},
+					}
+				},
+			),
 		},
 	}
 
