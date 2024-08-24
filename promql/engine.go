@@ -19,6 +19,8 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"hash"
+	"hash/fnv"
 	"math"
 	"reflect"
 	"runtime"
@@ -712,6 +714,7 @@ func (ng *Engine) execEvalStmt(ctx context.Context, query *query, s *parser.Eval
 			lookbackDelta:            s.LookbackDelta,
 			samplesStats:             query.sampleStats,
 			noStepSubqueryIntervalFn: ng.noStepSubqueryIntervalFn,
+			bindings:                 make(map[*parser.LetExpr]*bindingRef),
 		}
 		query.sampleStats.InitStepTracking(start, start, 1)
 
@@ -770,6 +773,7 @@ func (ng *Engine) execEvalStmt(ctx context.Context, query *query, s *parser.Eval
 		lookbackDelta:            s.LookbackDelta,
 		samplesStats:             query.sampleStats,
 		noStepSubqueryIntervalFn: ng.noStepSubqueryIntervalFn,
+		bindings:                 make(map[*parser.LetExpr]*bindingRef),
 	}
 	query.sampleStats.InitStepTracking(evaluator.startTimestamp, evaluator.endTimestamp, evaluator.interval)
 	val, warnings, err := evaluator.Eval(s.Expr)
@@ -1015,6 +1019,11 @@ type errWithWarnings struct {
 
 func (e errWithWarnings) Error() string { return e.err.Error() }
 
+type bindingRef struct {
+	val   parser.Value
+	annos annotations.Annotations
+}
+
 // An evaluator evaluates the given expressions over the given fixed
 // timestamps. It is attached to an engine through which it connects to a
 // querier and reports errors. On timeout or cancellation of its context it
@@ -1032,6 +1041,8 @@ type evaluator struct {
 	lookbackDelta            time.Duration
 	samplesStats             *stats.QuerySamples
 	noStepSubqueryIntervalFn func(rangeMillis int64) int64
+
+	bindings map[*parser.LetExpr]*bindingRef
 }
 
 // errorf causes a panic with the input formatted into an error.
@@ -1913,6 +1924,8 @@ func (ev *evaluator) eval(expr parser.Expr) (parser.Value, annotations.Annotatio
 			lookbackDelta:            ev.lookbackDelta,
 			samplesStats:             ev.samplesStats.NewChild(),
 			noStepSubqueryIntervalFn: ev.noStepSubqueryIntervalFn,
+			// Share the existing evaluator bindings.
+			bindings: ev.bindings,
 		}
 
 		if e.Step != 0 {
@@ -1940,6 +1953,7 @@ func (ev *evaluator) eval(expr parser.Expr) (parser.Value, annotations.Annotatio
 		ev.samplesStats.UpdatePeakFromSubquery(newEv.samplesStats)
 		ev.samplesStats.IncrementSamplesAtTimestamp(ev.endTimestamp, newEv.samplesStats.TotalSamples)
 		return res, ws
+
 	case *parser.StepInvariantExpr:
 		switch ce := e.Expr.(type) {
 		case *parser.StringLiteral, *parser.NumberLiteral:
@@ -1957,6 +1971,8 @@ func (ev *evaluator) eval(expr parser.Expr) (parser.Value, annotations.Annotatio
 			lookbackDelta:            ev.lookbackDelta,
 			samplesStats:             ev.samplesStats.NewChild(),
 			noStepSubqueryIntervalFn: ev.noStepSubqueryIntervalFn,
+			// Share the existing evaluator bindings.
+			bindings: ev.bindings,
 		}
 		res, ws := newEv.eval(e.Expr)
 		ev.currentSamples = newEv.currentSamples
@@ -2005,6 +2021,21 @@ func (ev *evaluator) eval(expr parser.Expr) (parser.Value, annotations.Annotatio
 		}
 		ev.samplesStats.UpdatePeak(ev.currentSamples)
 		return res, ws
+
+	case *parser.LetExpr:
+		result, anno := ev.eval(e.Expr)
+		// Stash it for future reference.
+		ev.bindings[e] = &bindingRef{result, anno}
+		// And evaluate the body.
+		return ev.eval(e.InExpr)
+
+	case *parser.RefExpr:
+		// Should have been preceded by a LetExpr. Look up the stored binding.
+		if b, ok := ev.bindings[e.Ref]; ok {
+			return b.val, b.annos
+		} else {
+			panic("internal error: RefExpr without a LetExpr")
+		}
 	}
 
 	panic(fmt.Errorf("unhandled expression of type: %T", expr))
@@ -3357,8 +3388,11 @@ func PreprocessExpr(expr parser.Expr, start, end time.Time) parser.Expr {
 
 	isStepInvariant := preprocessExprHelper(expr, start, end)
 	if isStepInvariant {
-		return newStepInvariantExpr(expr)
+		expr = newStepInvariantExpr(expr)
 	}
+
+	expr = preprocessCse(expr)
+
 	return expr
 }
 
@@ -3452,6 +3486,185 @@ func preprocessExprHelper(expr parser.Expr, start, end time.Time) bool {
 
 func newStepInvariantExpr(expr parser.Expr) parser.Expr {
 	return &parser.StepInvariantExpr{Expr: expr}
+}
+
+type cseInfo struct {
+	binding *parser.LetExpr
+	nodes   []*cseNode
+}
+
+type cseNode struct {
+	node   parser.Node
+	parent parser.Node
+}
+
+// preprocessCse performs common subexpression elimination on the given expression.
+func preprocessCse(expr parser.Expr) parser.Expr {
+	// Perform a post-order traversal of the expression tree. Compute hashes along the way.
+	// Keep a map of hash -> expr for all expressions encountered.
+	c := &cseRewriter{
+		nodeHash: make(map[parser.Node]uint64),
+		cseInfo:  make(map[uint64]*cseInfo),
+		bindings: []*parser.LetExpr{},
+	}
+
+	c.cseScan(expr, nil)
+
+	// Then do another top-down pass to find the largest common subexpressions.
+	// If we encounter one, and they're equal, capture the expression as a Let
+	// expr and replace matching expressions with a reference to the Let.
+	// If they're not equal (which would be a very rare hash collision), we
+	// simply keep scanning downward.
+	// Replace the matching node with a reference to the Let.
+
+	exp2, err := c.rewriteCse(expr)
+	if err != nil {
+		panic(err)
+	}
+
+	return exp2
+}
+
+// shouldCse returns true if the node type should be considered for common subexpression elimination.
+func shouldCse(n parser.Node) bool {
+	switch n.(type) {
+	case *parser.StringLiteral, *parser.NumberLiteral, *parser.RefExpr:
+		// Exclude literals and refs.
+		return false
+	}
+	return true
+}
+
+func (c *cseRewriter) cseScan(n parser.Node, parent parser.Node) hash.Hash64 {
+	h := fnv.New64a()
+	// TODO: fix this hash computation so it isn't n^2.
+	h.Write([]byte(n.String()))
+
+	for _, child := range parser.Children(n) {
+		childHash := c.cseScan(child, n)
+		h.Write(childHash.Sum(nil))
+	}
+
+	if !shouldCse(n) {
+		// Non-CSE nodes are hashed but not tracked.
+		return h
+	}
+
+	s := h.Sum64()
+	info, ok := c.cseInfo[s]
+	if !ok {
+		info = &cseInfo{
+			binding: nil,
+			nodes:   []*cseNode{},
+		}
+		c.cseInfo[s] = info
+	}
+	info.nodes = append(info.nodes, &cseNode{node: n, parent: parent})
+	c.nodeHash[n] = s
+	return h
+}
+
+func (c *cseRewriter) rewriteCse(expr parser.Expr) (parser.Expr, error) {
+	// TODO: this will be simpler if there's a parser.Rewrite() so we don't have
+	// to track and manipulate parent pointers.
+	if err := parser.Walk(c, expr, nil); err != nil {
+		return nil, err
+	}
+
+	// Now install any generated reference bindings. Since this is the only
+	// place in PromQL that can introduce variable bindings, we can just inject
+	// them at the root.
+	for _, b := range c.bindings {
+		b.InExpr = expr
+		expr = b
+	}
+
+	return expr, nil
+}
+
+type cseRewriter struct {
+	nodeHash map[parser.Node]uint64
+	cseInfo  map[uint64]*cseInfo
+	bindings []*parser.LetExpr
+}
+
+func (c *cseRewriter) Visit(node parser.Node, path []parser.Node) (w parser.Visitor, err error) {
+	if node == nil {
+		return c, nil
+	}
+	e, ok := node.(parser.Expr)
+	if !ok {
+		// Only interested in exprs.
+		return c, nil
+	}
+
+	h, nodeHit := c.nodeHash[e]
+	if !nodeHit {
+		// Not marked by scan phase.
+		return c, nil
+	}
+	inf, ok := c.cseInfo[h]
+	if !ok {
+		panic("hash found but no matches")
+	}
+	if len(inf.nodes) == 1 {
+		// No common subexpression.
+		return c, nil
+	}
+
+	if inf.binding == nil {
+		varName := fmt.Sprintf("var%d", len(c.bindings))
+		inf.binding = &parser.LetExpr{
+			Name:   varName,
+			Expr:   e,
+			InExpr: nil, // Will be set later when binding is installed.
+		}
+		c.bindings = append(c.bindings, inf.binding)
+	}
+
+	ref := &parser.RefExpr{
+		Ref: inf.binding,
+	}
+
+	for _, match := range inf.nodes {
+		if match.node != node {
+			continue
+		}
+
+		switch p := match.parent.(type) {
+		case *parser.BinaryExpr:
+			if p.LHS == match.node {
+				p.LHS = ref
+			} else {
+				p.RHS = ref
+			}
+		case *parser.Call:
+			for i, arg := range p.Args {
+				if arg == match.node {
+					p.Args[i] = ref
+				}
+			}
+		case *parser.MatrixSelector:
+			if p.VectorSelector == match.node {
+				p.VectorSelector = ref
+			}
+		case *parser.SubqueryExpr:
+			if p.Expr == match.node {
+				p.Expr = ref
+			}
+		case *parser.AggregateExpr:
+			if p.Expr == match.node {
+				p.Expr = ref
+			}
+		default:
+			panic(fmt.Sprintf("unexpected parent type %T", p))
+		}
+
+		// Tell the visitor code to stop traversing this subtree.
+		return nil, nil
+	}
+
+	return c, nil
 }
 
 // setOffsetForAtModifier modifies the offset of vector and matrix selector
