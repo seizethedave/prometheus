@@ -24,6 +24,7 @@ import (
 	"testing"
 
 	"github.com/go-kit/log"
+	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
 	"github.com/prometheus/prometheus/model/histogram"
@@ -269,6 +270,10 @@ func TestCheckpoint(t *testing.T) {
 			r := NewReader(sr)
 
 			samplesInCheckpoint, histogramsInCheckpoint, floatHistogramsInCheckpoint := 0, 0, 0
+
+			var allSeries []record.RefSeries
+			var allSamples []record.RefSample
+
 			for r.Next() {
 				rec := r.Record()
 
@@ -276,9 +281,14 @@ func TestCheckpoint(t *testing.T) {
 				case record.Series:
 					series, err = dec.Series(rec, series)
 					require.NoError(t, err)
+
+					allSeries = append(allSeries, series...)
 				case record.Samples:
 					samples, err := dec.Samples(rec, nil)
 					require.NoError(t, err)
+
+					allSamples = append(allSamples, samples...)
+
 					for _, s := range samples {
 						require.GreaterOrEqual(t, s.T, last/2, "sample with wrong timestamp")
 					}
@@ -331,6 +341,17 @@ func TestCheckpoint(t *testing.T) {
 			}
 			sort.Slice(metadata, func(i, j int) bool { return metadata[i].Ref < metadata[j].Ref })
 			require.Equal(t, expectedRefMetadata, metadata)
+
+		verifyLoop:
+			for _, samp := range allSamples {
+				for _, ser := range allSeries {
+					if samp.Ref == ser.Ref {
+						break verifyLoop
+					}
+				}
+				assert.Failf(t, "verification failed", "sample %d %d %f wasn't in the series list", samp.Ref, samp.T, samp.V)
+				println(len(allSeries))
+			}
 		})
 	}
 }
