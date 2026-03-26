@@ -403,149 +403,6 @@ func BenchmarkRoaringVsSlice_Delete(b *testing.B) {
 	}
 }
 
-// BenchmarkRoaringVsSlice_Memory compares heap memory of MemPostings-style storage
-// using []SeriesRef slices versus roaring.Bitmap per label pair.
-func BenchmarkRoaringVsSlice_Memory(b *testing.B) {
-	for _, tc := range []struct {
-		name            string
-		numSeries       int
-		labelsPerSeries int
-		uniqueNames     int
-		valuesPerName   int
-	}{
-		{
-			name:            "100k_series_typical",
-			numSeries:       100_000,
-			labelsPerSeries: 10,
-			uniqueNames:     20,
-			valuesPerName:   5_000,
-		},
-		{
-			name:            "500k_series_typical",
-			numSeries:       500_000,
-			labelsPerSeries: 10,
-			uniqueNames:     20,
-			valuesPerName:   25_000,
-		},
-		{
-			name:            "1M_series_typical",
-			numSeries:       1_000_000,
-			labelsPerSeries: 10,
-			uniqueNames:     20,
-			valuesPerName:   50_000,
-		},
-		{
-			name:            "1M_series_high_cardinality",
-			numSeries:       1_000_000,
-			labelsPerSeries: 15,
-			uniqueNames:     30,
-			valuesPerName:   100_000,
-		},
-	} {
-		b.Run(tc.name, func(b *testing.B) {
-			b.Run("slice_mempostings", func(b *testing.B) {
-				benchmarkMemPostingsMemory(b, tc.numSeries, tc.labelsPerSeries, tc.uniqueNames, tc.valuesPerName)
-			})
-
-			b.Run("roaring_mempostings", func(b *testing.B) {
-				benchmarkRoaringMemory(b, tc.numSeries, tc.labelsPerSeries, tc.uniqueNames, tc.valuesPerName)
-			})
-		})
-	}
-}
-
-func benchmarkRoaringMemory(b *testing.B, numSeries, labelsPerSeries, uniqueNames, valuesPerName int) {
-	b.Helper()
-
-	labelNames := make([]string, uniqueNames)
-	for i := range labelNames {
-		labelNames[i] = fmt.Sprintf("label_name_%04d", i)
-	}
-
-	labelValues := make([][]string, uniqueNames)
-	for i := range labelValues {
-		labelValues[i] = make([]string, valuesPerName)
-		for j := range labelValues[i] {
-			labelValues[i][j] = fmt.Sprintf("value_%s_%06d", labelNames[i], j)
-		}
-	}
-
-	type seriesLabels struct {
-		lset labels.Labels
-	}
-	allSeries := make([]seriesLabels, numSeries)
-	for i := range allSeries {
-		builder := labels.NewBuilder(labels.EmptyLabels())
-		for j := 0; j < labelsPerSeries && j < uniqueNames; j++ {
-			valIdx := i % len(labelValues[j])
-			builder.Set(labelNames[j], labelValues[j][valIdx])
-		}
-		allSeries[i].lset = builder.Labels()
-	}
-
-	runtime.GC()
-	runtime.GC()
-
-	b.ResetTimer()
-	b.ReportAllocs()
-
-	for n := 0; n < b.N; n++ {
-		b.StopTimer()
-		m := make(map[string]map[string]*roaring.Bitmap, 512)
-		runtime.GC()
-		runtime.GC()
-		var afterEmpty runtime.MemStats
-		runtime.ReadMemStats(&afterEmpty)
-		b.StartTimer()
-
-		for i, s := range allSeries {
-			ref := uint32(i + 1)
-			s.lset.Range(func(l labels.Label) {
-				nm, ok := m[l.Name]
-				if !ok {
-					nm = map[string]*roaring.Bitmap{}
-					m[l.Name] = nm
-				}
-				bm, ok := nm[l.Value]
-				if !ok {
-					bm = roaring.New()
-					nm[l.Value] = bm
-				}
-				bm.Add(ref)
-			})
-		}
-
-		b.StopTimer()
-
-		runtime.GC()
-		runtime.GC()
-		var after runtime.MemStats
-		runtime.ReadMemStats(&after)
-
-		memBytes := after.HeapAlloc - afterEmpty.HeapAlloc
-		bytesPerSeries := memBytes / uint64(numSeries)
-
-		b.ReportMetric(float64(memBytes), "mempostings_bytes")
-		b.ReportMetric(float64(bytesPerSeries), "bytes/series")
-		b.ReportMetric(float64(memBytes)/(1024*1024), "mempostings_MiB")
-
-		uniquePairs := 0
-		for j := 0; j < labelsPerSeries && j < uniqueNames; j++ {
-			seen := map[string]struct{}{}
-			for i := range allSeries {
-				valIdx := i % len(labelValues[j])
-				seen[labelValues[j][valIdx]] = struct{}{}
-			}
-			uniquePairs += len(seen)
-		}
-		b.ReportMetric(float64(uniquePairs), "unique_label_pairs")
-		b.ReportMetric(float64(memBytes)/float64(uniquePairs), "bytes/label_pair")
-
-		runtime.KeepAlive(m)
-		b.StartTimer()
-	}
-}
-
 // BenchmarkRoaringVsSlice_Memory_Realistic uses a mixed-cardinality label
 // distribution that mirrors a real Prometheus setup: a few low-cardinality labels
 // (job, env, cluster) where each value matches many series, and several
@@ -556,9 +413,7 @@ func BenchmarkRoaringVsSlice_Memory_Realistic(b *testing.B) {
 	for _, tc := range []struct {
 		name      string
 		numSeries int
-		// Each entry: {labelName, numUniqueValues}.
-		// refs/value ≈ numSeries/numUniqueValues.
-		labels []struct {
+		labels    []struct {
 			name   string
 			values int
 		}
@@ -570,16 +425,16 @@ func BenchmarkRoaringVsSlice_Memory_Realistic(b *testing.B) {
 				name   string
 				values int
 			}{
-				{"__name__", 500},      // 2000 refs/value
-				{"job", 10},            // 100K refs/value
-				{"env", 3},             // 333K refs/value
-				{"cluster", 5},         // 200K refs/value
-				{"namespace", 50},      // 20K refs/value
-				{"deployment", 200},    // 5K refs/value
-				{"pod", 10_000},        // 100 refs/value
-				{"container", 20_000},  // 50 refs/value
-				{"instance", 50_000},   // 20 refs/value
-				{"node", 1_000},        // 1K refs/value
+				{"__name__", 500},
+				{"job", 10},
+				{"env", 3},
+				{"cluster", 5},
+				{"namespace", 50},
+				{"deployment", 200},
+				{"pod", 10_000},
+				{"container", 20_000},
+				{"instance", 50_000},
+				{"node", 1_000},
 			},
 		},
 		{
@@ -589,16 +444,16 @@ func BenchmarkRoaringVsSlice_Memory_Realistic(b *testing.B) {
 				name   string
 				values int
 			}{
-				{"__name__", 200},   // 5K refs/value
-				{"job", 5},          // 200K refs/value
-				{"env", 2},          // 500K refs/value
-				{"region", 4},       // 250K refs/value
-				{"cluster", 10},     // 100K refs/value
-				{"team", 20},        // 50K refs/value
-				{"service", 100},    // 10K refs/value
-				{"version", 50},     // 20K refs/value
-				{"instance", 1_000}, // 1K refs/value
-				{"replica", 3},      // 333K refs/value
+				{"__name__", 200},
+				{"job", 5},
+				{"env", 2},
+				{"region", 4},
+				{"cluster", 10},
+				{"team", 20},
+				{"service", 100},
+				{"version", 50},
+				{"instance", 1_000},
+				{"replica", 3},
 			},
 		},
 	} {
@@ -625,75 +480,38 @@ func BenchmarkRoaringVsSlice_Memory_Realistic(b *testing.B) {
 				allSeries[i].lset = builder.Labels()
 			}
 
-			b.Run("slice_mempostings", func(b *testing.B) {
-				for n := 0; n < b.N; n++ {
-					b.StopTimer()
-					mp := NewMemPostings()
-					runtime.GC()
-					runtime.GC()
-					var afterEmpty runtime.MemStats
-					runtime.ReadMemStats(&afterEmpty)
-					b.StartTimer()
+			for n := 0; n < b.N; n++ {
+				b.StopTimer()
+				mp := NewMemPostings()
+				runtime.GC()
+				runtime.GC()
+				var afterEmpty runtime.MemStats
+				runtime.ReadMemStats(&afterEmpty)
+				b.StartTimer()
 
-					for i, s := range allSeries {
-						mp.Add(storage.SeriesRef(i+1), s.lset)
-					}
-
-					b.StopTimer()
-					runtime.GC()
-					runtime.GC()
-					var after runtime.MemStats
-					runtime.ReadMemStats(&after)
-					memBytes := after.HeapAlloc - afterEmpty.HeapAlloc
-					b.ReportMetric(float64(memBytes)/float64(tc.numSeries), "bytes/series")
-					b.ReportMetric(float64(memBytes)/(1024*1024), "mempostings_MiB")
-
-					totalPairs := 0
-					for _, ld := range tc.labels {
-						totalPairs += ld.values
-					}
-					totalPairs++ // allPostingsKey
-					b.ReportMetric(float64(totalPairs), "unique_label_pairs")
-					b.ReportMetric(float64(tc.numSeries)/float64(totalPairs), "avg_refs/pair")
-					runtime.KeepAlive(mp)
-					b.StartTimer()
+				for i, s := range allSeries {
+					mp.Add(storage.SeriesRef(i+1), s.lset)
 				}
-			})
 
-			b.Run("roaring_mempostings", func(b *testing.B) {
-				for n := 0; n < b.N; n++ {
-					b.StopTimer()
-					mp := NewRoaringMemPostings()
-					runtime.GC()
-					runtime.GC()
-					var afterEmpty runtime.MemStats
-					runtime.ReadMemStats(&afterEmpty)
-					b.StartTimer()
+				b.StopTimer()
+				runtime.GC()
+				runtime.GC()
+				var after runtime.MemStats
+				runtime.ReadMemStats(&after)
+				memBytes := after.HeapAlloc - afterEmpty.HeapAlloc
+				b.ReportMetric(float64(memBytes)/float64(tc.numSeries), "bytes/series")
+				b.ReportMetric(float64(memBytes)/(1024*1024), "mempostings_MiB")
 
-					for i, s := range allSeries {
-						mp.Add(storage.SeriesRef(i+1), s.lset)
-					}
-
-					b.StopTimer()
-					runtime.GC()
-					runtime.GC()
-					var after runtime.MemStats
-					runtime.ReadMemStats(&after)
-					memBytes := after.HeapAlloc - afterEmpty.HeapAlloc
-					b.ReportMetric(float64(memBytes)/float64(tc.numSeries), "bytes/series")
-					b.ReportMetric(float64(memBytes)/(1024*1024), "mempostings_MiB")
-
-					totalPairs := 0
-					for _, ld := range tc.labels {
-						totalPairs += ld.values
-					}
-					totalPairs++ // allPostingsKey
-					b.ReportMetric(float64(totalPairs), "unique_label_pairs")
-					b.ReportMetric(float64(tc.numSeries)/float64(totalPairs), "avg_refs/pair")
-					runtime.KeepAlive(mp)
-					b.StartTimer()
+				totalPairs := 0
+				for _, ld := range tc.labels {
+					totalPairs += ld.values
 				}
-			})
+				totalPairs++
+				b.ReportMetric(float64(totalPairs), "unique_label_pairs")
+				b.ReportMetric(float64(tc.numSeries)/float64(totalPairs), "avg_refs/pair")
+				runtime.KeepAlive(mp)
+				b.StartTimer()
+			}
 		})
 	}
 }

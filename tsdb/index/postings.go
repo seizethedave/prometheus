@@ -20,13 +20,13 @@ import (
 	"fmt"
 	"maps"
 	"math"
-	"runtime"
 	"slices"
 	"sort"
 	"strings"
 	"sync"
 	"time"
 
+	"github.com/RoaringBitmap/roaring/v2"
 	"github.com/bboreham/go-loser"
 
 	"github.com/prometheus/prometheus/model/labels"
@@ -42,40 +42,22 @@ func AllPostingsKey() (name, value string) {
 	return allPostingsKey.Name, allPostingsKey.Value
 }
 
-// ensureOrderBatchSize is the max number of postings passed to a worker in a single batch in MemPostings.EnsureOrder().
-const ensureOrderBatchSize = 1024
-
-// ensureOrderBatchPool is a pool used to recycle batches passed to workers in MemPostings.EnsureOrder().
-var ensureOrderBatchPool = sync.Pool{
-	New: func() any {
-		x := make([][]storage.SeriesRef, 0, ensureOrderBatchSize)
-		return &x // Return pointer type as preferred by Pool.
-	},
-}
-
-// MemPostings holds postings list for series ID per label pair. They may be written
-// to out of order.
-// EnsureOrder() must be called once before any reads are done. This allows for quick
-// unordered batch fills on startup.
+// MemPostings holds postings list for series ID per label pair, backed by
+// 32-bit Roaring bitmaps. Series refs must fit in uint32.
 type MemPostings struct {
 	mtx sync.RWMutex
 
 	// m holds the postings lists for each label-value pair, indexed first by label name, and then by label value.
 	//
 	// mtx must be held when interacting with m (the appropriate one for reading or writing).
-	// It is safe to retain a reference to a postings list after releasing the lock.
-	//
-	// BUG: There's currently a data race in addFor, which might modify the tail of the postings list:
-	// https://github.com/prometheus/prometheus/issues/15317
-	m map[string]map[string][]storage.SeriesRef
+	// It is safe to retain a reference to a postings bitmap after releasing the lock.
+	m map[string]map[string]*roaring.Bitmap
 
 	// lvs holds the label values for each label name.
 	// lvs[name] is essentially an unsorted append-only list of all keys in m[name]
 	// mtx must be held when interacting with lvs.
 	// Since it's append-only, it is safe to read the label values slice after releasing the lock.
 	lvs map[string][]string
-
-	ordered bool
 }
 
 const defaultLabelNamesMapSize = 512
@@ -83,20 +65,16 @@ const defaultLabelNamesMapSize = 512
 // NewMemPostings returns a memPostings that's ready for reads and writes.
 func NewMemPostings() *MemPostings {
 	return &MemPostings{
-		m:       make(map[string]map[string][]storage.SeriesRef, defaultLabelNamesMapSize),
-		lvs:     make(map[string][]string, defaultLabelNamesMapSize),
-		ordered: true,
+		m:   make(map[string]map[string]*roaring.Bitmap, defaultLabelNamesMapSize),
+		lvs: make(map[string][]string, defaultLabelNamesMapSize),
 	}
 }
 
 // NewUnorderedMemPostings returns a memPostings that is not safe to be read from
-// until EnsureOrder() was called once.
+// until EnsureOrder() was called once. Roaring bitmaps are always sorted, so
+// this is identical to NewMemPostings.
 func NewUnorderedMemPostings() *MemPostings {
-	return &MemPostings{
-		m:       make(map[string]map[string][]storage.SeriesRef, defaultLabelNamesMapSize),
-		lvs:     make(map[string][]string, defaultLabelNamesMapSize),
-		ordered: false,
-	}
+	return NewMemPostings()
 }
 
 // Symbols returns an iterator over all unique name and value strings, in order.
@@ -217,11 +195,11 @@ func (p *MemPostings) Stats(label string, limit int, labelSizeFunc func(string, 
 		labels.push(Stat{Name: n, Count: uint64(len(e))})
 		numLabelPairs += len(e)
 		size = 0
-		for name, values := range e {
+		for name, bm := range e {
+			seriesCnt := bm.GetCardinality()
 			if n == label {
-				metrics.push(Stat{Name: name, Count: uint64(len(values))})
+				metrics.push(Stat{Name: name, Count: seriesCnt})
 			}
-			seriesCnt := uint64(len(values))
 			labelValuePairs.push(Stat{Name: n + "=" + name, Count: seriesCnt})
 			size += labelSizeFunc(n, name, seriesCnt)
 		}
@@ -244,64 +222,9 @@ func (p *MemPostings) All() Postings {
 	return p.Postings(context.Background(), allPostingsKey.Name, allPostingsKey.Value)
 }
 
-// EnsureOrder ensures that all postings lists are sorted. After it returns all further
-// calls to add and addFor will insert new IDs in a sorted manner.
-// Parameter numberOfConcurrentProcesses is used to specify the maximal number of
-// CPU cores used for this operation. If it is <= 0, GOMAXPROCS is used.
-// GOMAXPROCS was the default before introducing this parameter.
-func (p *MemPostings) EnsureOrder(numberOfConcurrentProcesses int) {
-	p.mtx.Lock()
-	defer p.mtx.Unlock()
-
-	if p.ordered {
-		return
-	}
-
-	concurrency := numberOfConcurrentProcesses
-	if concurrency <= 0 {
-		concurrency = runtime.GOMAXPROCS(0)
-	}
-	workc := make(chan *[][]storage.SeriesRef)
-
-	var wg sync.WaitGroup
-	wg.Add(concurrency)
-
-	for i := 0; i < concurrency; i++ {
-		go func() {
-			for job := range workc {
-				for _, l := range *job {
-					slices.Sort(l)
-				}
-
-				*job = (*job)[:0]
-				ensureOrderBatchPool.Put(job)
-			}
-			wg.Done()
-		}()
-	}
-
-	nextJob := ensureOrderBatchPool.Get().(*[][]storage.SeriesRef)
-	for _, e := range p.m {
-		for _, l := range e {
-			*nextJob = append(*nextJob, l)
-
-			if len(*nextJob) >= ensureOrderBatchSize {
-				workc <- nextJob
-				nextJob = ensureOrderBatchPool.Get().(*[][]storage.SeriesRef)
-			}
-		}
-	}
-
-	// If the last job was partially filled, we need to push it to workers too.
-	if len(*nextJob) > 0 {
-		workc <- nextJob
-	}
-
-	close(workc)
-	wg.Wait()
-
-	p.ordered = true
-}
+// EnsureOrder is a no-op for Roaring bitmaps since they are always sorted.
+// Retained for API compatibility.
+func (p *MemPostings) EnsureOrder(_ int) {}
 
 // Delete removes all ids in the given map from the postings lists.
 // affectedLabels contains all the labels that are affected by the deletion, there's no need to check other labels.
@@ -309,17 +232,22 @@ func (p *MemPostings) Delete(deleted map[storage.SeriesRef]struct{}, affected ma
 	p.mtx.Lock()
 	defer p.mtx.Unlock()
 
+	delBM := roaring.New()
+	for ref := range deleted {
+		delBM.Add(uint32(ref))
+	}
+
 	affectedLabelNames := map[string]struct{}{}
 	process := func(l labels.Label) {
-		orig := p.m[l.Name][l.Value]
-		repl := make([]storage.SeriesRef, 0, len(orig))
-		for _, id := range orig {
-			if _, ok := deleted[id]; !ok {
-				repl = append(repl, id)
-			}
+		bm := p.m[l.Name][l.Value]
+		if bm == nil {
+			return
 		}
-		if len(repl) > 0 {
-			p.m[l.Name][l.Value] = repl
+		// Clone so readers holding a reference to the old bitmap are not affected.
+		newBM := bm.Clone()
+		newBM.AndNot(delBM)
+		if newBM.GetCardinality() > 0 {
+			p.m[l.Name][l.Value] = newBM
 		} else {
 			delete(p.m[l.Name], l.Value)
 			affectedLabelNames[l.Name] = struct{}{}
@@ -330,35 +258,25 @@ func (p *MemPostings) Delete(deleted map[storage.SeriesRef]struct{}, affected ma
 	for l := range affected {
 		i++
 		process(l)
-
-		// From time to time we want some readers to go through and read their postings.
-		// It takes around 50ms to process a 1K series batch, and 120ms to process a 10K series batch (local benchmarks on an M3).
-		// Note that a read query will most likely want to read multiple postings lists, say 5, 10 or 20 (depending on the number of matchers)
-		// And that read query will most likely evaluate only one of those matchers before we unpause here, so we want to pause often.
 		if i%512 == 0 {
 			p.unlockWaitAndLockAgain()
 		}
 	}
 	process(allPostingsKey)
 
-	// Now we need to update the label values slices.
 	i = 0
 	for name := range affectedLabelNames {
 		i++
-		// From time to time we want some readers to go through and read their postings.
 		if i%512 == 0 {
 			p.unlockWaitAndLockAgain()
 		}
 
 		if len(p.m[name]) == 0 {
-			// Delete the label name key if we deleted all values.
 			delete(p.m, name)
 			delete(p.lvs, name)
 			continue
 		}
 
-		// Create the new slice with enough room to grow without reallocating.
-		// We have deleted values here, so there's definitely some churn, so be prepared for it.
 		lvs := make([]string, 0, exponentialSliceGrowthFactor*len(p.m[name]))
 		for v := range p.m[name] {
 			lvs = append(lvs, v)
@@ -390,8 +308,8 @@ func (p *MemPostings) Iter(f func(labels.Label, Postings) error) error {
 	defer p.mtx.RUnlock()
 
 	for n, e := range p.m {
-		for v, p := range e {
-			if err := f(labels.Label{Name: n, Value: v}, NewListPostings(p)); err != nil {
+		for v, bm := range e {
+			if err := f(labels.Label{Name: n, Value: v}, newRoaringPostings(bm)); err != nil {
 				return err
 			}
 		}
@@ -423,40 +341,21 @@ func appendWithExponentialGrowth[T any](a []T, v T) []T {
 func (p *MemPostings) addFor(id storage.SeriesRef, l labels.Label) {
 	nm, ok := p.m[l.Name]
 	if !ok {
-		nm = map[string][]storage.SeriesRef{}
+		nm = map[string]*roaring.Bitmap{}
 		p.m[l.Name] = nm
 	}
-	vm, ok := nm[l.Value]
+	bm, ok := nm[l.Value]
 	if !ok {
+		bm = roaring.New()
+		nm[l.Value] = bm
 		p.lvs[l.Name] = appendWithExponentialGrowth(p.lvs[l.Name], l.Value)
 	}
-	list := appendWithExponentialGrowth(vm, id)
-	nm[l.Value] = list
-
-	if !p.ordered {
-		return
-	}
-	// There is no guarantee that no higher ID was inserted before as they may
-	// be generated independently before adding them to postings.
-	// We repair order violations on insert. The invariant is that the first n-1
-	// items in the list are already sorted.
-	for i := len(list) - 1; i >= 1; i-- {
-		if list[i] >= list[i-1] {
-			break
-		}
-		list[i], list[i-1] = list[i-1], list[i]
-	}
+	bm.Add(uint32(id))
 }
 
 func (p *MemPostings) PostingsForLabelMatching(ctx context.Context, name string, match func(string) bool) Postings {
-	// We'll take the label values slice and then match over that,
-	// this way we don't need to hold the mutex while we're matching,
-	// which can be slow (seconds) if the match function is a huge regex.
-	// Holding this lock prevents new series from being added (slows down the write path)
-	// and blocks the compaction process.
-	//
-	// We just need to make sure we don't modify the slice we took,
-	// so we'll append matching values to a different one.
+	// Take the label values slice without holding the lock during matching,
+	// which can be slow (seconds) for large regexes.
 	p.mtx.RLock()
 	readOnlyLabelValues := p.lvs[name]
 	p.mtx.RUnlock()
@@ -472,66 +371,98 @@ func (p *MemPostings) PostingsForLabelMatching(ctx context.Context, name string,
 		}
 	}
 
-	// If none matched (or this label had no values), no need to grab the lock again.
 	if len(vals) == 0 {
 		return EmptyPostings()
 	}
 
-	// Now `vals` only contains the values that matched, get their postings.
-	its := make([]*listPostings, 0, len(vals))
-	lps := make([]listPostings, len(vals))
 	p.mtx.RLock()
 	e := p.m[name]
-	for i, v := range vals {
-		if refs, ok := e[v]; ok {
-			// Some of the values may have been garbage-collected in the meantime this is fine, we'll just skip them.
-			// If we didn't let the mutex go, we'd have these postings here, but they would be pointing nowhere
-			// because there would be a `MemPostings.Delete()` call waiting for the lock to delete these labels,
-			// because the series were deleted already.
-			lps[i] = listPostings{list: refs}
-			its = append(its, &lps[i])
+	bitmaps := make([]*roaring.Bitmap, 0, len(vals))
+	for _, v := range vals {
+		if bm, ok := e[v]; ok {
+			bitmaps = append(bitmaps, bm)
 		}
 	}
-	// Let the mutex go before merging.
 	p.mtx.RUnlock()
 
-	return Merge(ctx, its...)
+	return mergedBitmapPostings(bitmaps)
 }
 
 // Postings returns a postings iterator for the given label values.
-func (p *MemPostings) Postings(ctx context.Context, name string, values ...string) Postings {
-	res := make([]*listPostings, 0, len(values))
-	lps := make([]listPostings, len(values))
+func (p *MemPostings) Postings(_ context.Context, name string, values ...string) Postings {
 	p.mtx.RLock()
 	postingsMapForName := p.m[name]
-	for i, value := range values {
-		if lp := postingsMapForName[value]; lp != nil {
-			lps[i] = listPostings{list: lp}
-			res = append(res, &lps[i])
+	bitmaps := make([]*roaring.Bitmap, 0, len(values))
+	for _, value := range values {
+		if bm := postingsMapForName[value]; bm != nil {
+			bitmaps = append(bitmaps, bm)
 		}
 	}
 	p.mtx.RUnlock()
-	return Merge(ctx, res...)
+	return mergedBitmapPostings(bitmaps)
 }
 
-func (p *MemPostings) PostingsForAllLabelValues(ctx context.Context, name string) Postings {
+// PostingsForAllLabelValues returns a merged postings list for all values of the given label name.
+func (p *MemPostings) PostingsForAllLabelValues(_ context.Context, name string) Postings {
 	p.mtx.RLock()
-
 	e := p.m[name]
-	its := make([]*listPostings, 0, len(e))
-	lps := make([]listPostings, len(e))
-	i := 0
-	for _, refs := range e {
-		if len(refs) > 0 {
-			lps[i] = listPostings{list: refs}
-			its = append(its, &lps[i])
+	bitmaps := make([]*roaring.Bitmap, 0, len(e))
+	for _, bm := range e {
+		if bm.GetCardinality() > 0 {
+			bitmaps = append(bitmaps, bm)
 		}
-		i++
 	}
-
-	// Let the mutex go before merging.
 	p.mtx.RUnlock()
-	return Merge(ctx, its...)
+	return mergedBitmapPostings(bitmaps)
+}
+
+// mergedBitmapPostings returns a Postings iterator over the union of the given bitmaps.
+func mergedBitmapPostings(bitmaps []*roaring.Bitmap) Postings {
+	if len(bitmaps) == 0 {
+		return EmptyPostings()
+	}
+	if len(bitmaps) == 1 {
+		return newRoaringPostings(bitmaps[0])
+	}
+	return newRoaringPostings(roaring.FastOr(bitmaps...))
+}
+
+// roaringPostings adapts a roaring.Bitmap iterator to the Postings interface.
+type roaringPostings struct {
+	it  roaring.IntPeekable
+	cur storage.SeriesRef
+}
+
+func newRoaringPostings(bm *roaring.Bitmap) *roaringPostings {
+	return &roaringPostings{it: bm.Iterator()}
+}
+
+func (rp *roaringPostings) Next() bool {
+	if rp.it.HasNext() {
+		rp.cur = storage.SeriesRef(rp.it.Next())
+		return true
+	}
+	return false
+}
+
+func (rp *roaringPostings) Seek(v storage.SeriesRef) bool {
+	if rp.cur >= v {
+		return true
+	}
+	rp.it.AdvanceIfNeeded(uint32(v))
+	if rp.it.HasNext() {
+		rp.cur = storage.SeriesRef(rp.it.Next())
+		return rp.cur >= v
+	}
+	return false
+}
+
+func (rp *roaringPostings) At() storage.SeriesRef {
+	return rp.cur
+}
+
+func (*roaringPostings) Err() error {
+	return nil
 }
 
 // ExpandPostings returns the postings expanded as a slice.

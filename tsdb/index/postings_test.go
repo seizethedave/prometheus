@@ -38,34 +38,47 @@ import (
 
 func TestMemPostings_addFor(t *testing.T) {
 	p := NewMemPostings()
-	p.m[allPostingsKey.Name] = map[string][]storage.SeriesRef{}
-	p.m[allPostingsKey.Name][allPostingsKey.Value] = []storage.SeriesRef{1, 2, 3, 4, 6, 7, 8}
+	for _, ref := range []storage.SeriesRef{1, 2, 3, 4, 6, 7, 8} {
+		p.addFor(ref, allPostingsKey)
+	}
 
 	p.addFor(5, allPostingsKey)
 
-	require.Equal(t, []storage.SeriesRef{1, 2, 3, 4, 5, 6, 7, 8}, p.m[allPostingsKey.Name][allPostingsKey.Value])
+	it := p.m[allPostingsKey.Name][allPostingsKey.Value].Iterator()
+	var got []storage.SeriesRef
+	for it.HasNext() {
+		got = append(got, storage.SeriesRef(it.Next()))
+	}
+	require.Equal(t, []storage.SeriesRef{1, 2, 3, 4, 5, 6, 7, 8}, got)
 }
 
 func TestMemPostings_ensureOrder(t *testing.T) {
 	p := NewUnorderedMemPostings()
-	p.m["a"] = map[string][]storage.SeriesRef{}
 
 	for i := range 100 {
-		l := make([]storage.SeriesRef, 100)
-		for j := range l {
-			l[j] = storage.SeriesRef(rand.Uint64())
+		for range 100 {
+			ref := storage.SeriesRef(rand.Uint32())
+			v := strconv.Itoa(i)
+			l := labels.Label{Name: "a", Value: v}
+			p.addFor(ref, l)
 		}
-		v := strconv.Itoa(i)
-
-		p.m["a"][v] = l
 	}
 
 	p.EnsureOrder(0)
 
 	for _, e := range p.m {
-		for _, l := range e {
-			ok := slices.IsSorted(l)
-			require.True(t, ok, "postings list %v is not sorted", l)
+		for v, bm := range e {
+			it := bm.Iterator()
+			var prev uint32
+			first := true
+			for it.HasNext() {
+				cur := it.Next()
+				if !first {
+					require.True(t, cur > prev, "postings list for %q is not sorted: %d >= %d", v, prev, cur)
+				}
+				prev = cur
+				first = false
+			}
 		}
 	}
 }
@@ -97,19 +110,16 @@ func BenchmarkMemPostings_ensureOrder(b *testing.B) {
 		b.Run(testName, func(b *testing.B) {
 			p := NewUnorderedMemPostings()
 
-			// Generate postings.
+			var refCounter uint32
 			for l := 0; l < testData.numLabels; l++ {
 				labelName := strconv.Itoa(l)
-				p.m[labelName] = map[string][]storage.SeriesRef{}
-
 				for v := 0; v < testData.numValuesPerLabel; v++ {
-					refs := make([]storage.SeriesRef, testData.numRefsPerValue)
-					for j := range refs {
-						refs[j] = storage.SeriesRef(rand.Uint64())
-					}
-
 					labelValue := strconv.Itoa(v)
-					p.m[labelName][labelValue] = refs
+					lbl := labels.Label{Name: labelName, Value: labelValue}
+					for range testData.numRefsPerValue {
+						refCounter++
+						p.addFor(storage.SeriesRef(refCounter), lbl)
+					}
 				}
 			}
 
@@ -117,7 +127,6 @@ func BenchmarkMemPostings_ensureOrder(b *testing.B) {
 
 			for b.Loop() {
 				p.EnsureOrder(0)
-				p.ordered = false
 			}
 		})
 	}
